@@ -663,19 +663,21 @@ public final class SplatRenderer: @unchecked Sendable {
     func renderEncoder(multiStage: Bool,
                        viewports: [ViewportDescriptor],
                        colorTexture: MTLTexture,
+                       colorLoadAction: MTLLoadAction = .clear,
                        colorStoreAction: MTLStoreAction,
                        depthTexture: MTLTexture?,
+                       depthLoadAction: MTLLoadAction = .clear,
                        rasterizationRateMap: MTLRasterizationRateMap?,
                        renderTargetArrayLength: Int,
                        for commandBuffer: MTLCommandBuffer) -> MTLRenderCommandEncoder {
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = colorTexture
-        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].loadAction = colorLoadAction
         renderPassDescriptor.colorAttachments[0].storeAction = colorStoreAction
         renderPassDescriptor.colorAttachments[0].clearColor = clearColor
         if let depthTexture {
             renderPassDescriptor.depthAttachment.texture = depthTexture
-            renderPassDescriptor.depthAttachment.loadAction = .clear
+            renderPassDescriptor.depthAttachment.loadAction = depthLoadAction
             renderPassDescriptor.depthAttachment.storeAction = .store
             renderPassDescriptor.depthAttachment.clearDepth = 0.0
         }
@@ -728,8 +730,10 @@ public final class SplatRenderer: @unchecked Sendable {
     @discardableResult
     public func render(viewports: [ViewportDescriptor],
                        colorTexture: MTLTexture,
+                       colorLoadAction: MTLLoadAction = .clear,
                        colorStoreAction: MTLStoreAction,
                        depthTexture: MTLTexture?,
+                       depthLoadAction: MTLLoadAction = .clear,
                        rasterizationRateMap: MTLRasterizationRateMap?,
                        renderTargetArrayLength: Int,
                        accessTimeout: TimeInterval = 0.1,
@@ -828,8 +832,10 @@ public final class SplatRenderer: @unchecked Sendable {
         let renderEncoder = renderEncoder(multiStage: multiStage,
                                           viewports: viewports,
                                           colorTexture: colorTexture,
+                                          colorLoadAction: colorLoadAction,
                                           colorStoreAction: colorStoreAction,
                                           depthTexture: depthTexture,
+                                          depthLoadAction: depthLoadAction,
                                           rasterizationRateMap: rasterizationRateMap,
                                           renderTargetArrayLength: renderTargetArrayLength,
                                           for: commandBuffer)
