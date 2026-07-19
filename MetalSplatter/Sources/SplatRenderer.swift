@@ -545,7 +545,20 @@ public final class SplatRenderer: @unchecked Sendable {
             ? library.makeRequiredFunction(name: "postprocessFragmentShader")
             : library.makeRequiredFunction(name: "postprocessFragmentShaderNoDepth")
 
-        pipelineDescriptor.colorAttachments[0]!.pixelFormat = colorFormat
+        // The imageblock accumulates premultiplied color over transparent black, so composite
+        // it over the existing framebuffer content with source-over blending. This preserves
+        // content loaded via colorLoadAction == .load (e.g. a previous SplatRenderer's output
+        // when rendering multiple renderers into the same textures in one frame).
+        let colorAttachment = pipelineDescriptor.colorAttachments[0]!
+        colorAttachment.pixelFormat = colorFormat
+        colorAttachment.isBlendingEnabled = true
+        colorAttachment.rgbBlendOperation = .add
+        colorAttachment.alphaBlendOperation = .add
+        colorAttachment.sourceRGBBlendFactor = .one
+        colorAttachment.sourceAlphaBlendFactor = .one
+        colorAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        colorAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        pipelineDescriptor.colorAttachments[0] = colorAttachment
         pipelineDescriptor.depthAttachmentPixelFormat = depthFormat
 
         pipelineDescriptor.maxVertexAmplificationCount = maxViewCount
