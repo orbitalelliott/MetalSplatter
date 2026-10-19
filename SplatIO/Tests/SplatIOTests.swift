@@ -368,6 +368,134 @@ final class SplatIOTests: XCTestCase {
 
         _ = try await reader.read()
     }
+
+    // MARK: - Variable spherical harmonics degrees (PLY)
+
+    /// A synthetic 3DGS ("INRIA-layout") binary PLY: x/y/z, normals, f_dc_0..2,
+    /// f_rest_0..(restCount-1), opacity, scale_0..2, rot_0..3 — all float32.
+    /// Point i sits at (i, i+0.25, i+0.5); f_rest_k carries 100+k so the
+    /// channel-to-interleaved reorganization is observable.
+    private func syntheticGaussianSplatPLY(restCount: Int, pointCount: Int, omitting omittedRestIndices: Set<Int> = []) -> Data {
+        let restIndices = (0..<restCount).filter { !omittedRestIndices.contains($0) }
+        let propertyNames = ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"]
+            + restIndices.map { "f_rest_\($0)" }
+            + ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+        var data = Data((["ply", "format binary_little_endian 1.0", "element vertex \(pointCount)"]
+            + propertyNames.map { "property float \($0)" }
+            + ["end_header", ""]).joined(separator: "\n").utf8)
+        for i in 0..<pointCount {
+            let row: [Float] = [Float(i), Float(i) + 0.25, Float(i) + 0.5, 0, 0, 0, 1, 2, 3]
+                + restIndices.map { Float(100 + $0) }
+                + [0, -2, -2, -2, 1, 0, 0, 0]
+            for value in row {
+                withUnsafeBytes(of: value.bitPattern.littleEndian) { data.append(contentsOf: $0) }
+            }
+        }
+        return data
+    }
+
+    func testReadPLYWithAnySHDegree() async throws {
+        // 3DGS exports carry 0 (SH0), 9 (SH1), 24 (SH2), or 45 (SH3) f_rest_*
+        // properties; the reader must accept the run that actually exists.
+        for restCount in [0, 9, 24, 45] {
+            let coeffsPerChannel = restCount / 3
+            let reader = try SplatPLYSceneReader(syntheticGaussianSplatPLY(restCount: restCount, pointCount: 3))
+            let content = try await ContentStorage(reader)
+            XCTAssertEqual(content.points.count, 3, "restCount=\(restCount)")
+            for (i, point) in content.points.enumerated() {
+                XCTAssertEqual(point.position, SIMD3(Float(i), Float(i) + 0.25, Float(i) + 0.5))
+                let sh = point.color.asSphericalHarmonicFloat
+                XCTAssertEqual(sh.count, 1 + coeffsPerChannel, "restCount=\(restCount)")
+                XCTAssertEqual(sh[0], SIMD3<Float>(1, 2, 3))
+                // f_rest_k was written channel-by-channel as 100+k, so interleaved
+                // coefficient c reads back as (100+c-1, +coeffsPerChannel, +2*coeffsPerChannel)
+                for c in 1..<sh.count {
+                    XCTAssertEqual(sh[c], SIMD3(Float(100 + c - 1),
+                                                Float(100 + c - 1 + coeffsPerChannel),
+                                                Float(100 + c - 1 + 2 * coeffsPerChannel)),
+                                   "restCount=\(restCount) coefficient \(c)")
+                }
+            }
+        }
+    }
+
+    func testReadPLYRejectsPartialSHChannels() async throws {
+        // 10 f_rest_* properties is not a whole number of RGB channels
+        let reader = try SplatPLYSceneReader(syntheticGaussianSplatPLY(restCount: 10, pointCount: 1))
+        do {
+            _ = try await ContentStorage(reader)
+            XCTFail("Expected unsupportedFileContents for a non-multiple-of-3 f_rest_* count")
+        } catch SplatPLYSceneReader.Error.unsupportedFileContents {
+            // Expected
+        }
+    }
+
+    func testReadPLYRejectsInvalidSHLayouts() async throws {
+        // A whole number of RGB channels isn't enough: the count must be exactly the layout of
+        // an SH degree, and every f_rest_* property must be part of the consecutive run.
+        let cases: [(restCount: Int, omitting: Set<Int>, reason: String)] = [
+            (12, [], "12 f_rest_* properties (4 per channel) is not an SH degree"),
+            (48, [], "48 f_rest_* properties is beyond SH degree 3"),
+            (45, [9], "a gap in the f_rest_* numbering"),
+        ]
+        for testCase in cases {
+            let reader = try SplatPLYSceneReader(syntheticGaussianSplatPLY(restCount: testCase.restCount,
+                                                                            pointCount: 1,
+                                                                            omitting: testCase.omitting))
+            do {
+                _ = try await ContentStorage(reader)
+                XCTFail("Expected unsupportedFileContents for \(testCase.reason)")
+            } catch SplatPLYSceneReader.Error.unsupportedFileContents {
+                // Expected
+            }
+        }
+    }
+
+    func testRewritePLYToPLYAtEachSHDegree() async throws {
+        // The PLY writer can emit degrees 0-3; the reader must read each back with all
+        // coefficients intact (testRewritePLYToPLY only covers the default degree 3).
+        for degree in [SHDegree.sh0, .sh1, .sh2, .sh3] {
+            var points = [SplatPoint]()
+            for i in 0..<3 {
+                let coefficients = (0..<degree.coefficientCount).map { c in
+                    let value = Float(i * 100 + c)
+                    return SIMD3<Float>(value, value + 0.25, value + 0.5)
+                }
+                points.append(SplatPoint(position: SIMD3<Float>(Float(i), 0, 0),
+                                         color: .sphericalHarmonicFloat(coefficients),
+                                         opacity: .linearFloat(0.9),
+                                         scale: .exponent(SIMD3<Float>(-3, -3, -3)),
+                                         rotation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)))
+            }
+
+            let writer = try SplatPLYSceneWriter(to: .memory)
+            try await writer.start(sphericalHarmonicDegree: UInt(degree.rawValue), pointCount: points.count)
+            try await writer.write(points)
+            try await writer.close()
+            guard let data = await writer.writtenData else {
+                XCTFail("Failed to get written data for degree \(degree)")
+                continue
+            }
+
+            let content = try await ContentStorage(SplatPLYSceneReader(data))
+            XCTAssertEqual(content.points.count, points.count, "degree \(degree)")
+            for (i, (original, readBack)) in zip(points, content.points).enumerated() {
+                XCTAssertEqual(readBack.color.shDegree, degree, "degree \(degree) point \(i)")
+                XCTAssertTrue(original.approximatelyEqual(to: readBack, compareSH0Only: false),
+                              "degree \(degree) point \(i) mismatch: \(original) vs \(readBack)")
+            }
+        }
+    }
+
+    func testSHDegreeExactCoefficientCount() {
+        XCTAssertEqual(SHDegree(coefficientCount: 1), .sh0)
+        XCTAssertEqual(SHDegree(coefficientCount: 4), .sh1)
+        XCTAssertEqual(SHDegree(coefficientCount: 9), .sh2)
+        XCTAssertEqual(SHDegree(coefficientCount: 16), .sh3)
+        for count in [0, 2, 3, 5, 8, 10, 15, 17] {
+            XCTAssertNil(SHDegree(coefficientCount: count), "count \(count)")
+        }
+    }
 }
 
 /// Tolerance values for comparing SplatPoints

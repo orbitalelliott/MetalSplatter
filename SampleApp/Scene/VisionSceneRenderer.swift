@@ -6,6 +6,7 @@ import MetalSplatter
 import os
 import SampleBoxRenderer
 import simd
+import SplatIO
 import SwiftUI
 
 extension LayerRenderer.Clock.Instant.Duration {
@@ -31,6 +32,7 @@ final class VisionSceneRenderer: @unchecked Sendable {
 
     private var model: ModelIdentifier?
     private var modelRenderer: (any ModelRenderer)?
+    private var proceduralSplatController: ProceduralSplatController?
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
 
@@ -67,6 +69,7 @@ final class VisionSceneRenderer: @unchecked Sendable {
         self.model = model
 
         modelRenderer = nil
+        proceduralSplatController = nil
         switch model {
         case .gaussianSplat(let url):
             let splat = try SplatRenderer(device: device,
@@ -75,8 +78,21 @@ final class VisionSceneRenderer: @unchecked Sendable {
                                           sampleCount: 1,
                                           maxViewCount: layerRenderer.properties.viewCount,
                                           maxSimultaneousRenders: Constants.maxSimultaneousRenders)
-            try await splat.read(from: url)
+            let reader = try AutodetectSceneReader(url)
+            let points = try await reader.readAll()
+            let chunk = try SplatChunk(device: device, from: points)
+            await splat.addChunk(chunk)
             modelRenderer = splat
+        case .proceduralSplat:
+            let controller = try await ProceduralSplatController(
+                device: device,
+                colorFormat: layerRenderer.configuration.colorFormat,
+                depthFormat: layerRenderer.configuration.depthFormat,
+                sampleCount: 1,
+                maxViewCount: layerRenderer.properties.viewCount,
+                maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+            proceduralSplatController = controller
+            modelRenderer = controller.splatRenderer
         case .sampleBox:
             modelRenderer = try SampleBoxRenderer(device: device,
                                                   colorFormat: layerRenderer.configuration.colorFormat,
@@ -145,11 +161,28 @@ final class VisionSceneRenderer: @unchecked Sendable {
         let drawables = frame.queryDrawables()
         guard !drawables.isEmpty else { return }
 
+        // If not ready to render, complete the frame lifecycle with empty
+        // command buffers to avoid CompositorServices "too many frames in
+        // flight" crash, then return early.
+        guard let modelRenderer, modelRenderer.isReadyToRender else {
+            frame.startSubmission()
+            for drawable in drawables {
+                guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+                    fatalError("Failed to create command buffer")
+                }
+                drawable.encodePresent(commandBuffer: commandBuffer)
+                commandBuffer.commit()
+            }
+            frame.endSubmission()
+            return
+        }
+
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)
 
         frame.startSubmission()
 
         updateRotation()
+        proceduralSplatController?.update()
 
         // Use first drawable for timing/anchor calculations
         let primaryDrawable = drawables[0]
@@ -173,25 +206,19 @@ final class VisionSceneRenderer: @unchecked Sendable {
 
             let viewports = self.viewports(drawable: drawable, deviceAnchor: deviceAnchor)
 
-            let didRender: Bool
             do {
-                didRender = try modelRenderer?.render(viewports: viewports,
-                                                      colorTexture: drawable.colorTextures[0],
-                                                      colorStoreAction: .store,
-                                                      depthTexture: drawable.depthTextures[0],
-                                                      rasterizationRateMap: drawable.rasterizationRateMaps.first,
-                                                      renderTargetArrayLength: layerRenderer.configuration.layout == .layered ? drawable.views.count : 1,
-                                                      to: commandBuffer) ?? false
+                try modelRenderer.render(viewports: viewports,
+                                          colorTexture: drawable.colorTextures[0],
+                                          colorStoreAction: .store,
+                                          depthTexture: drawable.depthTextures[0],
+                                          rasterizationRateMap: drawable.rasterizationRateMaps.first,
+                                          renderTargetArrayLength: layerRenderer.configuration.layout == .layered ? drawable.views.count : 1,
+                                          to: commandBuffer)
             } catch {
                 Self.log.error("Unable to render scene: \(error.localizedDescription)")
-                didRender = false
             }
 
-            // Only present if rendering occurred; otherwise drop the frame
-            if didRender {
-                drawable.encodePresent(commandBuffer: commandBuffer)
-            }
-
+            drawable.encodePresent(commandBuffer: commandBuffer)
             commandBuffer.commit()
         }
 

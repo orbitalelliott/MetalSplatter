@@ -6,6 +6,7 @@ import MetalSplatter
 import os
 import SampleBoxRenderer
 import simd
+import SplatIO
 import SwiftUI
 
 @MainActor
@@ -20,6 +21,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 
     var model: ModelIdentifier?
     var modelRenderer: (any ModelRenderer)?
+    var proceduralSplatController: ProceduralSplatController?
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
 
@@ -44,6 +46,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         self.model = model
 
         modelRenderer = nil
+        proceduralSplatController = nil
         switch model {
         case .gaussianSplat(let url):
             let splat = try SplatRenderer(device: device,
@@ -52,8 +55,21 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                           sampleCount: metalKitView.sampleCount,
                                           maxViewCount: 1,
                                           maxSimultaneousRenders: Constants.maxSimultaneousRenders)
-            try await splat.read(from: url)
+            let reader = try AutodetectSceneReader(url)
+            let points = try await reader.readAll()
+            let chunk = try SplatChunk(device: device, from: points)
+            await splat.addChunk(chunk)
             modelRenderer = splat
+        case .proceduralSplat:
+            let controller = try await ProceduralSplatController(
+                device: device,
+                colorFormat: metalKitView.colorPixelFormat,
+                depthFormat: metalKitView.depthStencilPixelFormat,
+                sampleCount: metalKitView.sampleCount,
+                maxViewCount: 1,
+                maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+            proceduralSplatController = controller
+            modelRenderer = controller.splatRenderer
         case .sampleBox:
             modelRenderer = try! SampleBoxRenderer(device: device,
                                                    colorFormat: metalKitView.colorPixelFormat,
@@ -98,7 +114,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        guard let modelRenderer else { return }
+        guard let modelRenderer, modelRenderer.isReadyToRender else { return }
         guard let drawable = view.currentDrawable else { return }
 
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)
@@ -114,6 +130,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         }
 
         updateRotation()
+        proceduralSplatController?.update()
 
         let didRender: Bool
         do {
@@ -129,7 +146,6 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             didRender = false
         }
 
-        // Only present if rendering occurred; otherwise drop the frame
         if didRender {
             commandBuffer.present(drawable)
         }
